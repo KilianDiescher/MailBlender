@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <PackageReference Include="AE.Net.Mail" Version="1.7.10" />
+    <PackageReference Include="System.Data.SQLite.Core" Version="1.0.119" />
   </ItemGroup>
 
 </Project>
