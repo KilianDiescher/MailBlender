@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections;
+using System.IO.Compression;
 using System.Text;
 using AE.Net.Mail;
 
@@ -9,10 +10,17 @@ class Program
     static List<Attachment> printStack = new List<Attachment>();
     static HashSet<string> processedMessages = new HashSet<string>();
     static string processedMessagesFile = "processedMessages.txt";
+    static string blendsDirectory = "ToDo";
+    static string blendsOutput = "Finished";
 
     static void Main(string[] args)
     {
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
+        if (!Directory.Exists(blendsOutput))
+        {
+            Directory.CreateDirectory(blendsOutput);
+        }
 
         LoadProcessedMessages();
 
@@ -30,7 +38,6 @@ class Program
             for (int i = 0; i < messageCount; i++)
             {
                 var message = client.GetMessage(i);
-                Console.WriteLine("Received " + $"Subject: {message.Subject}");
                 mails.Add(message);
             }
 
@@ -50,8 +57,9 @@ class Program
             {
                 foreach (var attachment in mail.Attachments)
                 {
-                    if (attachment.Filename.EndsWith(".blend") && !processedMessages.Contains(mail.MessageID))
+                    if ((attachment.Filename.EndsWith(".blend") || attachment.Filename.EndsWith(".zip")) && !processedMessages.Contains(mail.MessageID))
                     {
+                        Console.WriteLine("Received: " + mail.Subject);
                         printStack.Add(attachment);
                         processedMessages.Add(mail.MessageID);
                     }
@@ -79,9 +87,36 @@ class Program
 
     static void saveBlends()
     {
+        // Ensure the directory exists
+        if (!Directory.Exists(blendsDirectory))
+        {
+            Directory.CreateDirectory(blendsDirectory);
+        }
+
         foreach (var attachment in printStack)
         {
-            File.WriteAllBytes(attachment.Filename, attachment.GetData());
+            if (attachment.Filename.EndsWith(".blend"))
+            {
+                string filePath = Path.Combine(blendsDirectory, attachment.Filename);
+                File.WriteAllBytes(filePath, attachment.GetData());
+            }
+            else if (attachment.Filename.EndsWith(".zip"))
+            {
+                using (var memoryStream = new MemoryStream(attachment.GetData()))
+                {
+                    using (var archive = new ZipArchive(memoryStream))
+                    {
+                        foreach (var entry in archive.Entries)
+                        {
+                            if (entry.FullName.EndsWith(".blend", StringComparison.OrdinalIgnoreCase))
+                            {
+                                string filePath = Path.Combine(blendsDirectory, entry.FullName);
+                                entry.ExtractToFile(filePath, true);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
