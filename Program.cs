@@ -43,16 +43,17 @@ class MailBlender
         SQLiteConnection connection = new SQLiteConnection("Data Source=" + addresssDb);
         
         connection.Open();
-        
+
 
         using (var command = new SQLiteCommand(connection))
         {
             command.CommandText = @"
                 CREATE TABLE IF NOT EXISTS Contacts (
-                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    MessageID TEXT NOT NULL,
-                    Email TEXT NOT NULL
-                )";
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                MessageID TEXT NOT NULL,
+                Email TEXT NOT NULL,
+                OriginalFilename TEXT NOT NULL
+                 )";
             command.ExecuteNonQuery();
         }
 
@@ -67,7 +68,7 @@ class MailBlender
     }
 
 
-    static void saveToDb(string messageID, string email)
+    static void saveToDb(string messageID, string email, string originalFilename)
     {
         using (SQLiteConnection connection = new SQLiteConnection("Data Source=" + addresssDb))
         {
@@ -82,16 +83,19 @@ class MailBlender
                 if (count == 0)
                 {
                     // Insert the email if it does not exist
-                    command.CommandText = "INSERT INTO Contacts (MessageID, Email) VALUES (@MessageID, @Email)";
+                    command.CommandText = "INSERT INTO Contacts (MessageID, Email, OriginalFilename) VALUES (@MessageID, @Email, @OriginalFilename)";
                     command.Parameters.AddWithValue("@MessageID", messageID);
                     command.Parameters.AddWithValue("@Email", email);
+                    command.Parameters.AddWithValue("@OriginalFilename", originalFilename);
                     command.ExecuteNonQuery();
                 }
             }
         }
     }
 
-    
+
+
+
     static void RunScript(object state)
     {
         using (var client = new ImapClient("imap.gmx.com", "RenderForMe@gmx.net", "RFM@GMX.NET", AuthMethods.Login, 993, true))
@@ -101,7 +105,6 @@ class MailBlender
             {
                 var message = client.GetMessage(i);
                 mails.Add(message);
-                saveToDb(message.MessageID, message.From.Address);
             }
 
             client.Disconnect();
@@ -124,11 +127,12 @@ class MailBlender
             {
                 foreach (var attachment in mail.Attachments)
                 {
-                    if ((attachment.Filename.EndsWith(".blend") || attachment.Filename.EndsWith(".zip")) && !processedMessages.Contains(mail.MessageID))
+                    if ((attachment.Filename.EndsWith(".blend") || attachment.Filename.EndsWith(".zip")) && !processedMessages.Contains(SanitizeFileName(mail.MessageID)))
                     {
                         Console.WriteLine("Received: " + mail.Subject);
                         printStack.Add(attachment);
-                        processedMessages.Add(mail.MessageID);
+                        processedMessages.Add(SanitizeFileName(mail.MessageID));
+                        saveToDb(SanitizeFileName(mail.MessageID), mail.From.Address, attachment.Filename);
                     }
                 }
             }
@@ -157,6 +161,15 @@ class MailBlender
         File.WriteAllLines(processedMessagesFile, processedMessages);
     }
 
+    static string SanitizeFileName(string fileName)
+    {
+        foreach (char c in Path.GetInvalidFileNameChars())
+        {
+            fileName = fileName.Replace(c, '_');
+        }
+        return fileName;
+    }
+
     static void saveBlends()
     {
         // Ensure the directory exists
@@ -169,7 +182,9 @@ class MailBlender
         {
             if (attachment.Filename.EndsWith(".blend"))
             {
-                string filePath = Path.Combine(blendsDirectory, attachment.Filename);
+                string messageID = mails.First(m => m.Attachments.Contains(attachment)).MessageID;
+                string sanitizedMessageID = SanitizeFileName(messageID);
+                string filePath = Path.Combine(blendsDirectory, sanitizedMessageID + ".blend");
                 File.WriteAllBytes(filePath, attachment.GetData());
             }
             else if (attachment.Filename.EndsWith(".zip"))
@@ -182,7 +197,9 @@ class MailBlender
                         {
                             if (entry.FullName.EndsWith(".blend", StringComparison.OrdinalIgnoreCase))
                             {
-                                string filePath = Path.Combine(blendsDirectory, entry.FullName);
+                                string messageID = mails.First(m => m.Attachments.Contains(attachment)).MessageID;
+                                string sanitizedMessageID = SanitizeFileName(messageID);
+                                string filePath = Path.Combine(blendsDirectory, sanitizedMessageID + ".blend");
                                 entry.ExtractToFile(filePath, true);
                             }
                         }
@@ -190,7 +207,10 @@ class MailBlender
                 }
             }
         }
+        printStack.Clear();
     }
+
+
 
     static string[] getToDo()
     {
@@ -201,7 +221,7 @@ class MailBlender
     static void renderAnimation(string file)
     {
         string blendFile = file;
-        string blendFileName = Path.GetFileName(blendFile);
+        string blendFileName = Path.GetFileName(Path.GetFileNameWithoutExtension(file));
         string blendOutput = Path.Combine(Path.GetFullPath(blendsOutput), blendFileName);
 
 
@@ -261,12 +281,14 @@ class MailBlender
 
     static void sendBack(string file)
     {
-        string finishedFileDirectory = Path.Combine(blendsOutput, Path.GetFileName(file));
-        string zipFilePath = Path.Combine(blendsOutput, Path.GetFileNameWithoutExtension(file) + ".zip");
+        string messageID = Path.GetFileNameWithoutExtension(file);
+        string originalFilename = GetOriginalFilename(messageID);
+        string finishedFileDirectory = Path.Combine(blendsOutput, Path.GetFileNameWithoutExtension(file));
+        string zipFilePath = Path.Combine(blendsOutput, Path.GetFileNameWithoutExtension(originalFilename) + ".zip");
 
         if (!Directory.Exists(finishedFileDirectory))
         {
-            Console.WriteLine("Directory not found in the Finished folder.");
+            Console.WriteLine("Directory not found in the Finished folder." + finishedFileDirectory);
             return;
         }
 
@@ -278,6 +300,14 @@ class MailBlender
 
         Console.WriteLine("Sending back: " + zipFilePath);
 
+        string recipientEmail = GetRecipientEmail(messageID);
+
+        if (string.IsNullOrEmpty(recipientEmail))
+        {
+            Console.WriteLine("Recipient email not found.");
+            return;
+        }
+
         using (var client = new ImapClient("imap.gmx.com", "RenderForMe@gmx.net", "RFM@GMX.NET", AuthMethods.Login, 993, true))
         {
             SmtpClient smtp = new SmtpClient("mail.gmx.com")
@@ -287,16 +317,59 @@ class MailBlender
                 Credentials = new System.Net.NetworkCredential("RenderForMe@gmx.net", "RFM@GMX.NET")
             };
 
-            var message = new System.Net.Mail.MailMessage
+            using (var message = new System.Net.Mail.MailMessage
             {
                 From = new MailAddress("RenderForMe@Gmx.net"),
                 Subject = "Rendered Animation",
                 Body = "Your animation has been rendered.",
                 Attachments = { new System.Net.Mail.Attachment(zipFilePath) }
-            };
+            })
+            {
+                message.To.Add(new MailAddress(recipientEmail));
+                smtp.Send(message);
+                Console.WriteLine("Email sent to: " + recipientEmail);
+            }
+            client.Disconnect();
+        }
 
-            //message.To.Add(new MailAddress())
+        // Delete the zip file after sending the email
+        if (File.Exists(zipFilePath))
+        {
+            File.Delete(zipFilePath);
+            Console.WriteLine("Deleted zip file: " + zipFilePath);
         }
     }
 
+    static string GetOriginalFilename(string messageID)
+    {
+        using (SQLiteConnection connection = new SQLiteConnection("Data Source=" + addresssDb))
+        {
+            connection.Open();
+            using (var command = new SQLiteCommand(connection))
+            {
+                command.CommandText = "SELECT OriginalFilename FROM Contacts WHERE MessageID = @MessageID";
+                command.Parameters.AddWithValue("@MessageID", messageID);
+                var result = command.ExecuteScalar();
+                return result != null ? result.ToString() : string.Empty;
+            }
+        }
+    }
+
+    static string GetRecipientEmail(string messageID)
+    {
+        using (SQLiteConnection connection = new SQLiteConnection("Data Source=" + addresssDb))
+        {
+            connection.Open();
+            using (var command = new SQLiteCommand(connection))
+            {
+                command.CommandText = "SELECT Email FROM Contacts WHERE MessageID = @MessageID";
+                command.Parameters.AddWithValue("@MessageID", messageID);
+                var result = command.ExecuteScalar();
+                return result != null ? result.ToString() : string.Empty;
+            }
+        }
+    }
+
+
 }
+
